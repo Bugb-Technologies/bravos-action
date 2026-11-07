@@ -1,0 +1,179 @@
+# @comment -- "The Bravos pull-request security gate as a reusable action: the same rulings as `bravos sync --ci`'s bravos-pr-gate.yml and the pre-PR hook. Deterministic: it runs guardlink only, spends no model and needs no secret or licence. A gate input that fails or does not parse fails the step as unknown, never passes."
+name: Bravos security gate
+description: Gate pull requests on the GuardLink threat model, with no model and no secret. Lint new claims, require disclosure of new exposure, block confirmed exploits on changed files.
+author: BugB Technologies
+branding:
+  icon: shield
+  color: gray-dark
+
+inputs:
+  base-ref:
+    description: The branch the pull request merges into. The gate compares against its merge base.
+    default: ${{ github.base_ref }}
+  pr-body:
+    description: The pull request description. Each new unmitigated exposure must be named in it by threat and asset id.
+    default: ${{ github.event.pull_request.body }}
+  guardlink-version:
+    description: The guardlink version from npm. Defaults to the version Bravos pins.
+    default: '2.5.0'
+  working-directory:
+    description: The directory that holds the threat model (.guardlink/).
+    default: '.'
+  sarif:
+    description: Write guardlink.sarif for code scanning ('true' or 'false').
+    default: 'true'
+
+outputs:
+  sarif-file:
+    description: Path of the SARIF file, when sarif is 'true'.
+    value: ${{ steps.sarif.outputs.file }}
+  new-exposures:
+    description: Number of new unmitigated exposures this pull request adds.
+    value: ${{ steps.disclose.outputs.count }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the checkout
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+      run: |
+        if [ -z "$BASE_REF" ]; then
+          echo "::error::bravos gate: no base branch. Run it on pull_request, or set base-ref."
+          exit 1
+        fi
+        if ! git rev-parse --verify --quiet "origin/$BASE_REF" > /dev/null; then
+          echo "::error::bravos gate: origin/$BASE_REF is not in this checkout. Use actions/checkout with fetch-depth: 0."
+          exit 1
+        fi
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Install guardlink
+      shell: bash
+      env:
+        GUARDLINK_VERSION: ${{ inputs.guardlink-version }}
+      run: npm install -g "guardlink@$GUARDLINK_VERSION"
+
+    - name: Merge base
+      id: base
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+      run: echo "sha=$(git merge-base HEAD "origin/$BASE_REF")" >> "$GITHUB_OUTPUT"
+
+    # Whole-token id matching shared by the disclosure and @ticket checks: `#api` is not `#api-key`.
+    - name: jq helpers
+      shell: bash
+      run: |
+        cat > "$RUNNER_TEMP/named.jq" <<'EOF'
+        def esc: gsub("(?<c>[.*+?^${}()|\\[\\]\\\\])"; "\\\(.c)");
+        def named($text; $id): ($id | type) == "string" and ($text | test("(?<![\\w#.-])" + ($id | esc) + "(?![\\w-])"));
+        EOF
+
+    - name: Threat model parses and resolves
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: guardlink validate .
+
+    - name: New claims meet the evidence bar
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BASE_SHA: ${{ steps.base.outputs.sha }}
+      run: |
+        status=0
+        guardlink lint . --since "$BASE_SHA" --json > "$RUNNER_TEMP/lint.json" || status=$?
+        if ! errors=$(jq -er '.summary.errors | numbers' "$RUNNER_TEMP/lint.json"); then
+          echo "::error::unknown: guardlink lint --since $BASE_SHA exited $status without guardlink.lint JSON"
+          exit 1
+        fi
+        if [ "$errors" != "0" ]; then
+          echo "::error::guardlink lint reports $errors error(s) in this PR's claims; apply each violation's fix (the bravos-ship skill does)."
+          jq '.violations' "$RUNNER_TEMP/lint.json"
+          exit 1
+        fi
+
+    # Each new unmitigated exposure must be disclosed in the PR body by both its threat and its asset
+    # id, so an honest @exposes + @audit is reported rather than blocked forever. The body reaches the
+    # shell through env, never inline, so its text cannot run as a command.
+    - name: No undisclosed new exposure
+      id: disclose
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PR_BODY: ${{ inputs.pr-body }}
+        BASE_SHA: ${{ steps.base.outputs.sha }}
+      run: |
+        diff="$RUNNER_TEMP/diff.json"
+        if ! guardlink diff "$BASE_SHA" --json > "$diff"; then
+          echo "::error::unknown: guardlink diff $BASE_SHA --json failed"
+          exit 1
+        fi
+        if ! jq -e '.newUnmitigatedExposures | arrays' "$diff" > /dev/null; then
+          echo "::error::unknown: guardlink diff $BASE_SHA --json has no newUnmitigatedExposures"
+          exit 1
+        fi
+        echo "count=$(jq '.newUnmitigatedExposures | length' "$diff")" >> "$GITHUB_OUTPUT"
+        jq -r '.newUnmitigatedExposures[] | "- \(.threat) on \(.asset) — \(.location.file):\(.location.line)"' "$diff" >> "$GITHUB_STEP_SUMMARY"
+        jq -r -L "$RUNNER_TEMP" --arg body "$PR_BODY" 'include "named";
+          .newUnmitigatedExposures[] | select((named($body; .threat) and named($body; .asset)) | not)
+          | "\(.threat) on \(.asset) — \(.location.file):\(.location.line)"' "$diff" > "$RUNNER_TEMP/undisclosed.txt"
+        if [ -s "$RUNNER_TEMP/undisclosed.txt" ]; then
+          echo "::error::This PR adds unmitigated exposure the PR body does not disclose. Name each threat and asset id in its description:"
+          cat "$RUNNER_TEMP/undisclosed.txt"
+          exit 1
+        fi
+
+    # A confirmed-exploitable claim on a file this PR changes blocks it, unless that same file carries
+    # a ticket line (the @ticket verb) for the same threat and asset.
+    - name: No confirmed exploit on a changed path
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BASE_SHA: ${{ steps.base.outputs.sha }}
+      run: |
+        ci="$RUNNER_TEMP/ci.json"
+        if ! guardlink ci -f json > "$ci"; then
+          echo "::error::unknown: guardlink ci -f json failed"
+          exit 1
+        fi
+        if ! jq -e '.confirmed | arrays' "$ci" > /dev/null; then
+          echo "::error::unknown: guardlink ci -f json did not produce guardlink.ci JSON with confirmed[]"
+          exit 1
+        fi
+        git diff --relative --name-only "$BASE_SHA"...HEAD > "$RUNNER_TEMP/changed.txt"
+        jq -r '.confirmed[] | [.location.file, (.location.line | tostring), .threat, .asset, (.severity // "unrated")] | @tsv' "$ci" > "$RUNNER_TEMP/confirmed.tsv"
+        hits=""
+        while IFS=$'\t' read -r file line threat asset severity; do
+          grep -qxF -- "$file" "$RUNNER_TEMP/changed.txt" || continue
+          if [ -f "$file" ] && jq -Rne -L "$RUNNER_TEMP" --arg t "$threat" --arg a "$asset" 'include "named";
+               [inputs | select(contains("@ticket") and named(.; $t) and named(.; $a))] | length > 0' < "$file" > /dev/null; then
+            continue
+          fi
+          hits+="$severity $threat on $asset — $file:$line"$'\n'
+        done < "$RUNNER_TEMP/confirmed.tsv"
+        if [ -n "$hits" ]; then
+          echo "::error::Confirmed-exploitable claims on changed files, with no @ticket for them in that file:"
+          printf '%s' "$hits"
+          exit 1
+        fi
+
+    - name: Undefended paths (informational)
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: guardlink paths --json > "$RUNNER_TEMP/paths.json" || echo "::warning::guardlink paths failed; informational only"
+
+    - name: SARIF for code scanning
+      id: sarif
+      if: inputs.sarif == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        guardlink sarif . --profile github -o guardlink.sarif
+        echo "file=$(pwd)/guardlink.sarif" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,76 @@
+# @comment -- "Runs the action against test/fixture three ways: the unchanged fixture passes; a commit that adds an exposure the description does not name fails; the same commit with the exposure named passes. The second run must fail, or this workflow fails."
+name: self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Unchanged fixture passes
+        uses: ./
+        with:
+          base-ref: main
+          working-directory: test/fixture
+          pr-body: ''
+
+      - name: Add an exposure in a new commit
+        shell: bash
+        working-directory: test/fixture
+        run: |
+          git config user.name self-test
+          git config user.email self-test@example.com
+          git update-ref refs/remotes/origin/main HEAD
+          cat >> app/server.py <<'PY'
+
+
+          # @exposes #api to #cmdi [P0] cwe:CWE-78 -- "request.form name reaches subprocess.Popen with shell=True in export_notes"
+          # @audit #api -- "export name is not validated before it reaches the shell"
+          # @comment -- "POST /export archives the database under a caller-chosen name"
+          @app.post("/export")
+          def export_notes():
+              import subprocess
+              subprocess.Popen(f"tar czf /tmp/{request.form['name']}.tgz notes.db", shell=True)
+              return {"ok": True}
+          PY
+          git commit -qam "add export"
+
+      - name: Undisclosed exposure fails
+        id: undisclosed
+        continue-on-error: true
+        uses: ./
+        with:
+          base-ref: main
+          working-directory: test/fixture
+          pr-body: 'Adds an export route.'
+          sarif: 'false'
+
+      - name: Disclosed exposure passes
+        id: disclosed
+        uses: ./
+        with:
+          base-ref: main
+          working-directory: test/fixture
+          pr-body: 'Adds an export route. Security gate: #cmdi on #api, audited.'
+
+      - name: Check the outcomes
+        shell: bash
+        env:
+          UNDISCLOSED: ${{ steps.undisclosed.outcome }}
+          COUNT: ${{ steps.disclosed.outputs.new-exposures }}
+        run: |
+          [ "$UNDISCLOSED" = "failure" ] || { echo "::error::the undisclosed exposure did not fail the gate ($UNDISCLOSED)"; exit 1; }
+          [ "$COUNT" = "1" ] || { echo "::error::expected 1 new exposure, got '$COUNT'"; exit 1; }
+          echo "undisclosed: $UNDISCLOSED; disclosed: passed with $COUNT new exposure"
