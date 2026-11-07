@@ -1,6 +1,6 @@
 # @comment -- "The Bravos pull-request security gate as a reusable action: the same rulings as `bravos sync --ci`'s bravos-pr-gate.yml and the pre-PR hook. Deterministic: it runs guardlink only, spends no model and needs no secret or licence. A gate input that fails or does not parse fails the step as unknown, never passes."
 name: Bravos security gate
-description: Gate pull requests on the GuardLink threat model, with no model and no secret. Lint new claims, require disclosure of new exposure, block confirmed exploits on changed files.
+description: "Gate pull requests on the GuardLink threat model: lint new claims, require disclosed exposures, block confirmed exploits."
 author: BugB Technologies
 branding:
   icon: shield
